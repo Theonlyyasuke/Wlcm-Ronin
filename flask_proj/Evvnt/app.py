@@ -1,14 +1,18 @@
-from flask import Blueprint, request, jsonify, current_app, url_for
-from ..extensions import db
-from ..models import User, Role
+from flask import Flask, jsonify, request, url_for, current_app
+from .extensions import db, migrate, jwt
+from .models import User, Role, Event, Booking, BookingStatus
+from .utils import role_required
 from flask_jwt_extended import create_access_token, create_refresh_token, jwt_required, get_jwt_identity
-import datetime
-from ..utils import role_required 
 from itsdangerous import URLSafeTimedSerializer
+from .config import Config
+from flask import Blueprint
 
-bp = Blueprint("auth", __name__, url_prefix="/api/auth")
+# ----------------------------
+# AUTH BLUEPRINT
+# ----------------------------
+auth_bp = Blueprint("auth", __name__, url_prefix="/api/auth")
 
-@bp.route("/register", methods=["POST"])
+@auth_bp.route("/register", methods=["POST"])
 def register():
     data = request.get_json()
     email = data.get("email")
@@ -27,7 +31,7 @@ def register():
     db.session.commit()
     return jsonify({"msg": "Registered", "user_id": user.id}), 201
 
-@bp.route("/login", methods=["POST"])
+@auth_bp.route("/login", methods=["POST"])
 def login():
     data = request.get_json()
     email = data.get("email")
@@ -42,24 +46,21 @@ def login():
     refresh = create_refresh_token(identity=user.id)
     return jsonify({"access_token": access, "refresh_token": refresh, "user": {"id": user.id, "email": user.email, "role": user.role}}), 200
 
-@bp.route("/forgot-password", methods=["POST"])
+@auth_bp.route("/forgot-password", methods=["POST"])
 def forgot_password():
     data = request.get_json()
     email = data.get("email")
     user = User.query.filter_by(email=email).first()
     if not user:
-        # don't reveal whether email exists
         return jsonify({"msg": "If the email exists, a reset link will be sent."}), 200
 
-    # create token (itsdangerous) -- include user id
     s = URLSafeTimedSerializer(current_app.config["RESET_PASSWORD_SECRET"])
     token = s.dumps({"user_id": user.id})
-    # In production, send email with the token link
     reset_url = url_for("auth.reset_password", token=token, _external=True)
-    current_app.logger.info(f"Password reset link (DEV): {reset_url}")  # replace with email send
+    current_app.logger.info(f"Password reset link (DEV): {reset_url}")
     return jsonify({"msg": "If the email exists, a reset link will be sent."}), 200
 
-@bp.route("/reset-password/<token>", methods=["POST"])
+@auth_bp.route("/reset-password/<token>", methods=["POST"])
 def reset_password(token):
     data = request.get_json()
     new_password = data.get("password")
@@ -68,7 +69,7 @@ def reset_password(token):
 
     s = URLSafeTimedSerializer(current_app.config["RESET_PASSWORD_SECRET"])
     try:
-        payload = s.loads(token, max_age=3600)  # 1 hour
+        payload = s.loads(token, max_age=3600)
     except Exception:
         return jsonify({"msg": "Invalid or expired token"}), 400
 
@@ -80,17 +81,13 @@ def reset_password(token):
     db.session.commit()
     return jsonify({"msg": "Password reset successful"}), 200
 
-from flask import Blueprint, request, jsonify
-from ..extensions import db
-from ..models import Event, User, Role
-from ..utils import role_required
-from flask_jwt_extended import jwt_required, get_jwt_identity
+# ----------------------------
+# EVENTS BLUEPRINT
+# ----------------------------
+events_bp = Blueprint("events", __name__, url_prefix="/api/events")
 
-bp = Blueprint("events", __name__, url_prefix="/api/events")
-
-@bp.route("", methods=["GET"])
+@events_bp.route("", methods=["GET"])
 def list_events():
-    # add pagination & filters
     page = int(request.args.get("page", 1))
     per_page = min(int(request.args.get("per_page", 20)), 100)
     q = Event.query.order_by(Event.start_time.desc()).paginate(page=page, per_page=per_page, error_out=False)
@@ -101,7 +98,7 @@ def list_events():
     } for e in q.items]
     return jsonify({"events": events, "total": q.total, "page": page}), 200
 
-@bp.route("/<int:event_id>", methods=["GET"])
+@events_bp.route("/<int:event_id>", methods=["GET"])
 def get_event(event_id):
     e = Event.query.get_or_404(event_id)
     return jsonify({
@@ -110,13 +107,12 @@ def get_event(event_id):
         "capacity": e.capacity, "price_naira": e.price_naira, "organizer_id": e.organizer_id
     }), 200
 
-@bp.route("/create", methods=["POST"])
+@events_bp.route("/create", methods=["POST"])
 @jwt_required()
 @role_required(Role.ORGANIZER, Role.ADMIN)
 def create_event():
     data = request.get_json()
     current_user_id = get_jwt_identity()
-    # Minimal validation
     required = ["title", "start_time"]
     for r in required:
         if r not in data:
@@ -128,40 +124,35 @@ def create_event():
         start_time=data["start_time"],
         end_time=data.get("end_time"),
         capacity=data.get("capacity", 0),
-        price_cents=int(data.get("price_naira", 0)),
+        price_naira=int(data.get("price_naira", 0)),
         organizer_id=current_user_id
     )
     db.session.add(e)
     db.session.commit()
     return jsonify({"msg": "Created", "event_id": e.id}), 201
 
-@bp.route("/<int:event_id>/update", methods=["PATCH"])
+@events_bp.route("/<int:event_id>/update", methods=["PATCH"])
 @jwt_required()
 def update_event(event_id):
     data = request.get_json()
     e = Event.query.get_or_404(event_id)
     current_user_id = get_jwt_identity()
-    # Only organizer of event or admin can update
     if e.organizer_id != current_user_id:
-        # check admin
-        from ..models import User
         user = User.query.get(current_user_id)
         if user.role != Role.ADMIN:
             return jsonify({"msg": "Not authorized"}), 403
-    # update allowed fields
     for field in ["title", "description", "location", "start_time", "end_time", "capacity", "price_naira"]:
         if field in data:
             setattr(e, field, data[field])
     db.session.commit()
     return jsonify({"msg": "Updated"}), 200
 
-@bp.route("/<int:event_id>/delete", methods=["DELETE"])
+@events_bp.route("/<int:event_id>/delete", methods=["DELETE"])
 @jwt_required()
 def delete_event(event_id):
     e = Event.query.get_or_404(event_id)
     current_user_id = get_jwt_identity()
     if e.organizer_id != current_user_id:
-        from ..models import User
         user = User.query.get(current_user_id)
         if user.role != Role.ADMIN:
             return jsonify({"msg": "Not authorized"}), 403
@@ -169,15 +160,12 @@ def delete_event(event_id):
     db.session.commit()
     return jsonify({"msg": "Deleted"}), 200
 
+# ----------------------------
+# BOOKINGS BLUEPRINT
+# ----------------------------
+bookings_bp = Blueprint("bookings", __name__, url_prefix="/api/bookings")
 
-from flask import Blueprint, request, jsonify
-from ..extensions import db
-from ..models import Booking, Event, BookingStatus
-from flask_jwt_extended import jwt_required, get_jwt_identity
-
-bp = Blueprint("bookings", __name__, url_prefix="/api/bookings")
-
-@bp.route("", methods=["GET"])
+@bookings_bp.route("", methods=["GET"])
 @jwt_required()
 def list_user_bookings():
     user_id = get_jwt_identity()
@@ -193,7 +181,7 @@ def list_user_bookings():
         })
     return jsonify({"bookings": result}), 200
 
-@bp.route("/<int:booking_id>", methods=["GET"])
+@bookings_bp.route("/<int:booking_id>", methods=["GET"])
 @jwt_required()
 def get_booking(booking_id):
     user_id = get_jwt_identity()
@@ -201,10 +189,11 @@ def get_booking(booking_id):
     if b.user_id != user_id:
         return jsonify({"msg": "Not authorized"}), 403
     return jsonify({
-        "id": b.id, "event_id": b.event_id, "quantity": b.quantity, "total_price_naira": b.total_price_naira, "status": b.status
+        "id": b.id, "event_id": b.event_id, "quantity": b.quantity,
+        "total_price_naira": b.total_price_naira, "status": b.status
     }), 200
 
-@bp.route("/create", methods=["POST"])
+@bookings_bp.route("/create", methods=["POST"])
 @jwt_required()
 def create_booking():
     data = request.get_json()
@@ -215,19 +204,17 @@ def create_booking():
         return jsonify({"msg": "event_id and quantity are required"}), 400
 
     event = Event.query.get_or_404(event_id)
-    # capacity check (simple)
-    total_booked = sum(b.quantity for b in event.tickets if b.status == BookingStatus.ACTIVE)
+    total_booked = sum(b.quantity for b in event.bookings if b.status == BookingStatus.ACTIVE)
     if event.capacity and (total_booked + quantity) > event.capacity:
         return jsonify({"msg": "Not enough capacity"}), 400
 
     total_price = event.price_naira * quantity
-    # Payment flow would go here (placeholder)
     booking = Booking(user_id=user_id, event_id=event_id, quantity=quantity, total_price_naira=total_price)
     db.session.add(booking)
     db.session.commit()
     return jsonify({"msg": "Booked", "booking_id": booking.id}), 201
 
-@bp.route("/cancel/<int:booking_id>", methods=["POST"])
+@bookings_bp.route("/cancel/<int:booking_id>", methods=["POST"])
 @jwt_required()
 def cancel_booking(booking_id):
     user_id = get_jwt_identity()
@@ -238,19 +225,14 @@ def cancel_booking(booking_id):
         return jsonify({"msg": "Already cancelled"}), 400
     b.status = BookingStatus.CANCELLED
     db.session.commit()
-    # Optionally refund (placeholder)
     return jsonify({"msg": "Cancelled"}), 200
 
+# ----------------------------
+# ADMIN BLUEPRINT
+# ----------------------------
+admin_bp = Blueprint("admin", __name__, url_prefix="/api/users")
 
-from flask import Blueprint, jsonify, request
-from ..extensions import db
-from ..models import User
-from ..utils import role_required
-from flask_jwt_extended import jwt_required
-
-bp = Blueprint("admin", __name__, url_prefix="/api/users")
-
-@bp.route("", methods=["GET"])
+@admin_bp.route("", methods=["GET"])
 @jwt_required()
 @role_required("admin")
 def list_users():
@@ -260,14 +242,14 @@ def list_users():
     users = [{"id": u.id, "email": u.email, "role": u.role, "is_active": u.is_active} for u in q.items]
     return jsonify({"users": users, "total": q.total}), 200
 
-@bp.route("/<int:user_id>", methods=["GET"])
+@admin_bp.route("/<int:user_id>", methods=["GET"])
 @jwt_required()
 @role_required("admin")
 def get_user(user_id):
     u = User.query.get_or_404(user_id)
     return jsonify({"id": u.id, "email": u.email, "role": u.role, "is_active": u.is_active}), 200
 
-@bp.route("/<int:user_id>/deactivate", methods=["POST"])
+@admin_bp.route("/<int:user_id>/deactivate", methods=["POST"])
 @jwt_required()
 @role_required("admin")
 def deactivate_user(user_id):
@@ -276,3 +258,38 @@ def deactivate_user(user_id):
     db.session.commit()
     return jsonify({"msg": "User deactivated"}), 200
 
+# ----------------------------
+# CREATE APP
+# ----------------------------
+def create_app():
+    app = Flask(__name__)
+
+    # --- Config directly here instead of Config.py ---
+    app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///evvnt.db"
+    app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
+    app.config["JWT_SECRET_KEY"] = "supersecretkey"
+    app.config["RESET_PASSWORD_SECRET"] = "anothersecretkey"
+
+    db.init_app(app)
+    migrate.init_app(app, db)
+    jwt.init_app(app)
+
+    app.register_blueprint(auth_bp)
+    app.register_blueprint(events_bp)
+    app.register_blueprint(bookings_bp)
+    app.register_blueprint(admin_bp)
+
+    @app.errorhandler(404)
+    def not_found(e):
+        return jsonify({"msg": "Not found"}), 404
+
+    @app.errorhandler(500)
+    def server_error(e):
+        app.logger.exception("Server error")
+        return jsonify({"msg": "Server error"}), 500
+
+    return app
+
+if __name__ == "__main__":
+    app = create_app()
+    app.run(debug=True)
