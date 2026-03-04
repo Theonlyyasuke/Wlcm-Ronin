@@ -1,0 +1,21 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Age Calculator</title>
+</head>
+<body>
+    <h1>Age Calculator</h1>
+    <form method = "POST">
+        <label> Your Name:</label>
+        <input Type = "text" name = "name" required><br><br>
+        <label>Birth Year:</label>
+        <input type = "number" name = "birth_year"
+required><br><br>
+         <button type = "submit"> Calculate Age</button>
+    </form>
+
+    {% if age %}
+        <h2>hello {{name}}: You are {{age}} years old.</h2>
+    {% endif %}
+</body>
+</html>
